@@ -628,6 +628,7 @@ def test_barrier_counter_barriers():
 
 def test_all_counters_parallel_matmul():
 
+    bsize = 16
     knl = lp.make_kernel(
             "{[i,k,j]: 0<=i<n and 0<=k<m and 0<=j<l}",
             [
@@ -635,9 +636,9 @@ def test_all_counters_parallel_matmul():
             ],
             name="matmul", assumptions="n,m,l >= 1")
     knl = lp.add_and_infer_dtypes(knl, dict(a=np.float32, b=np.float32))
-    knl = lp.split_iname(knl, "i", 16, outer_tag="g.0", inner_tag="l.1")
-    knl = lp.split_iname(knl, "j", 16, outer_tag="g.1", inner_tag="l.0")
-    knl = lp.split_iname(knl, "k", 16)
+    knl = lp.split_iname(knl, "i", bsize, outer_tag="g.0", inner_tag="l.1")
+    knl = lp.split_iname(knl, "j", bsize, outer_tag="g.1", inner_tag="l.0")
+    knl = lp.split_iname(knl, "k", bsize)
     knl = lp.add_prefetch(knl, "a", ["k_inner", "i_inner"])
     knl = lp.add_prefetch(knl, "b", ["j_inner", "k_inner"])
 
@@ -649,7 +650,7 @@ def test_all_counters_parallel_matmul():
     sync_map = lp.get_synchronization_map(knl)
     assert len(sync_map) == 2
     assert sync_map["kernel_launch"].eval_with_dict(params) == 1
-    assert sync_map["barrier_local"].eval_with_dict(params) == 2*m/16
+    assert sync_map["barrier_local"].eval_with_dict(params) == 2*m/bsize
 
     op_map = lp.get_op_map(knl)
     f32mul = op_map[
@@ -669,14 +670,19 @@ def test_all_counters_parallel_matmul():
 
     op_map = lp.get_mem_access_map(knl)
 
-    f32coal = op_map[lp.MemAccess('global', np.float32,
+    f32s1lb = op_map[lp.MemAccess('global', np.float32,
                      stride=1, direction='load', variable='b')
                      ].eval_with_dict(params)
-    f32coal += op_map[lp.MemAccess('global', np.float32,
-                      stride=1, direction='load', variable='a')
-                      ].eval_with_dict(params)
+    f32s1la = op_map[lp.MemAccess('global', np.float32,
+                     stride=1, direction='load', variable='a')
+                     ].eval_with_dict(params)
 
-    assert f32coal == n*m+m*l
+    # this is not correct, each element in a and b is fetched more than once
+    #assert f32coal == n*m+m*l
+
+    # this should be correct
+    assert f32s1lb == (m/bsize)*n*m
+    assert f32s1la == (m/bsize)*m*l
 
     f32coal = op_map[lp.MemAccess('global', np.float32,
                      stride=1, direction='store', variable='c')
@@ -800,6 +806,23 @@ def test_summations_and_filters():
                key.direction == 'load'
     s1f64l = mem_map.filter_by_func(func_filter).eval_and_sum(params)
     assert s1f64l == 2*n*m
+
+
+def test_count():
+    from loopy.statistics import count
+    import islpy as isl
+
+    knl = lp.make_kernel("[] -> {[]: }", [""" """])
+
+    s = isl.Set("[n] -> { [i0, i1] : 96*floor((n)/96) = n and n > 0 "
+                "and i0 >= 0 and i1 >= 0 and 16*floor((i0)/16) <= -16 + n "
+                "and 16*floor((i1)/16) <= -16 + n }")
+    ct = count(knl, s)
+
+    expected = isl.PwQPolynomial("[n] -> { (225 + -30 * n + n^2) : "
+                                 "96*floor((n)/96) = n and n >= 16 }")
+
+    assert ct.plain_is_equal(expected)
 
 
 if __name__ == "__main__":
